@@ -110,3 +110,117 @@ void handleBluetoothCommands() {
         Serial.println("▶️ System Resumed");
         SerialBT.println("System Resumed");
         break;
+        
+      default:
+        // Bluetooth PWM control (0-9)
+        if (currentMode == 0 && command >= '0' && command <= '9') {
+          bluetoothPWM = map((command - '0'), 0, 9, 0, 255);
+          Serial.print("🎯 Bluetooth PWM: ");
+          Serial.println(bluetoothPWM);
+          SerialBT.print("PWM set to: ");
+          SerialBT.println(bluetoothPWM);
+        }
+        break;
+    }
+  }
+}
+
+void executeCurrentMode() {
+  int currentPWM = 0;
+  
+  if (currentMode == 0) {
+    // Bluetooth Mode - Use value from Bluetooth
+    currentPWM = bluetoothPWM;
+  } else {
+    // Distance Mode - Calculate PWM based on distance
+    currentPWM = calculatePWMFromDistance();
+  }
+  
+  // Send to STM32 only if PWM value changed
+  if (currentPWM != previousPWM) {
+    sendPWMToSTM32(currentPWM);
+    previousPWM = currentPWM;
+  }
+}
+
+int calculatePWMFromDistance() {
+  // Read sensor only at specified intervals
+  if (millis() - lastSensorRead < SENSOR_READ_INTERVAL) {
+    return previousPWM; // Return previous value if not time to read yet
+  }
+  
+  lastSensorRead = millis();
+  
+  // Read distance from HC-SR04
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  duration = pulseIn(echoPin, HIGH, 30000); // Timeout after 30ms
+  distance = duration * 0.034 / 2;
+  
+  // Validate distance reading
+  if (duration == 0 || distance > 200 || distance < 2) {
+    Serial.println("❌ Invalid distance reading");
+    return 0; // Stop motor on invalid reading
+  }
+  
+  // Map distance to PWM (Jauh → Cepat, Dekat → Lambat)
+  int pwmValue;
+  if (distance >= 50) {
+    pwmValue = 255; // Max speed - Far away
+  } else if (distance >= 30) {
+    pwmValue = 200; // Fast
+  } else if (distance >= 20) {
+    pwmValue = 150; // Medium
+  } else if (distance >= 10) {
+    pwmValue = 100; // Slow
+  } else if (distance >= 5) {
+    pwmValue = 50;  // Very slow
+  } else {
+    pwmValue = 0;   // Stop - Too close
+  }
+  
+  // Debug info
+  Serial.print("📏 Distance: ");
+  Serial.print(distance);
+  Serial.print("cm | PWM: ");
+  Serial.println(pwmValue);
+  
+  // Send to Bluetooth if connected
+  if (SerialBT.hasClient()) {
+    SerialBT.print("Distance: ");
+    SerialBT.print(distance);
+    SerialBT.print("cm | PWM: ");
+    SerialBT.println(pwmValue);
+  }
+  
+  return pwmValue;
+}
+
+void sendPWMToSTM32(int pwmValue) {
+  // Send PWM value to STM32 via UART
+  STM32_UART.println(pwmValue);
+  
+  Serial.print("📤 Sent to STM32: ");
+  Serial.println(pwmValue);
+}
+
+// Optional: Handle incoming data from STM32 (for encoder feedback, etc.)
+void checkSTM32Response() {
+  if (STM32_UART.available()) {
+    String response = STM32_UART.readStringUntil('\n');
+    response.trim();
+    Serial.print("📥 STM32 Response: ");
+    Serial.println(response);
+    
+    // Forward to Bluetooth if needed
+    if (SerialBT.hasClient()) {
+      SerialBT.print("STM32: ");
+      SerialBT.println(response);
+    }
+  }
+}
+
