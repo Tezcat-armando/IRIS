@@ -1,0 +1,434 @@
+# 🎯 Konsep Dual Sensor dengan Seleksi PWM via Bluetooth
+
+**YA, konsep ini SANGAT DAPAT diimplementasikan** dan bahkan merupakan pengembangan yang sangat powerful! Berikut analisis lengkap dan implementasinya:
+
+## 🔧 **1. Perubahan Rangkaian yang Diperlukan**
+
+### 📍 **Koneksi Dua HC-SR04 ke STM32:**
+
+| Sensor | STM32 Pin | Keterangan |
+|--------|-----------|------------|
+| **Sensor Kiri VCC** | 5V | Power |
+| **Sensor Kiri Trig** | PA0 | Output trigger |
+| **Sensor Kiri Echo** | PA1 | Input echo (+ voltage divider) |
+| **Sensor Kanan VCC** | 5V | Power |
+| **Sensor Kanan Trig** | PA2 | Output trigger |
+| **Sensor Kanan Echo** | PA3 | Input echo (+ voltage divider) |
+| **GND Kedua Sensor** | GND | Ground common |
+
+### 🔄 **Komunikasi Tetap Sama:**
+```
+ESP32 → STM32: Perintah mode & kontrol
+STM32 → ESP32: Data kedua sensor
+```
+
+## 🎮 **2. Protokol Komunikasi Baru**
+
+### **STM32 → ESP32 (Data Sensor):**
+```cpp
+"SENSORS:L:125,R:180\n"  // Left: 125cm, Right: 180cm
+```
+
+### **ESP32 → STM32 (Kontrol Mode & PWM):**
+```cpp
+"MODE:LEFT\n"     // Gunakan sensor kiri
+"MODE:RIGHT\n"    // Gunakan sensor kanan  
+"MODE:AVG\n"      // Rata-rata kedua sensor
+"MODE:MIN\n"      // Gunakan nilai terdekat
+"PWM:150\n"       // Nilai PWM (jika manual)
+```
+
+## 💻 **3. Program STM32 (Dual Sensor Reader)**
+
+```c
+/* STM32 CODE - DUAL SENSOR SLAVE */
+#include "main.h"
+#include <string.h>
+#include <stdio.h>
+
+// Sensor Kiri
+#define LEFT_TRIG_PIN GPIO_PIN_0
+#define LEFT_ECHO_PIN GPIO_PIN_1
+#define LEFT_GPIO_PORT GPIOA
+
+// Sensor Kanan  
+#define RIGHT_TRIG_PIN GPIO_PIN_2
+#define RIGHT_ECHO_PIN GPIO_PIN_3
+#define RIGHT_GPIO_PORT GPIOA
+
+// Variables
+uint32_t left_distance = 0;
+uint32_t right_distance = 0;
+uint8_t pwm_value = 0;
+uint8_t sensor_mode = 0; // 0=Left, 1=Right, 2=Avg, 3=Min
+
+// UART Buffer
+char uart_buffer[32];
+uint8_t uart_index = 0;
+
+void read_sensor(uint32_t* distance, GPIO_TypeDef* trig_port, uint16_t trig_pin, 
+                 GPIO_TypeDef* echo_port, uint16_t echo_pin) {
+    // Trigger pulse
+    HAL_GPIO_WritePin(trig_port, trig_pin, GPIO_PIN_RESET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(trig_port, trig_pin, GPIO_PIN_SET);
+    HAL_DelayMicroseconds(10);
+    HAL_GPIO_WritePin(trig_port, trig_pin, GPIO_PIN_RESET);
+    
+    // Wait for echo with timeout
+    uint32_t timeout = 10000;
+    uint32_t start_time = HAL_GetTick();
+    
+    // Wait for echo start
+    while (HAL_GPIO_ReadPin(echo_port, echo_pin) == GPIO_PIN_RESET) {
+        if (HAL_GetTick() - start_time > timeout) {
+            *distance = 0;
+            return;
+        }
+    }
+    
+    uint32_t pulse_start = HAL_GetTick();
+    
+    // Wait for echo end
+    while (HAL_GPIO_ReadPin(echo_port, echo_pin) == GPIO_PIN_SET) {
+        if (HAL_GetTick() - start_time > timeout) {
+            *distance = 0;
+            return;
+        }
+    }
+    
+    uint32_t pulse_end = HAL_GetTick();
+    
+    // Calculate distance (cm)
+    uint32_t duration = pulse_end - pulse_start;
+    *distance = (duration * 34) / 200;
+}
+
+void read_both_sensors(void) {
+    read_sensor(&left_distance, LEFT_GPIO_PORT, LEFT_TRIG_PIN, 
+                LEFT_GPIO_PORT, LEFT_ECHO_PIN);
+    
+    // Small delay between sensors to avoid interference
+    HAL_Delay(5);
+    
+    read_sensor(&right_distance, RIGHT_GPIO_PORT, RIGHT_TRIG_PIN,
+                RIGHT_GPIO_PORT, RIGHT_ECHO_PIN);
+}
+
+void send_sensor_data(void) {
+    char message[50];
+    sprintf(message, "SENSORS:L:%lu,R:%lu\n", left_distance, right_distance);
+    HAL_UART_Transmit(&huart2, (uint8_t*)message, strlen(message), 100);
+}
+
+void process_uart_command(char* command) {
+    printf("Received: %s\n", command);
+    
+    if (strncmp(command, "MODE:LEFT", 9) == 0) {
+        sensor_mode = 0;
+        printf("Mode set: LEFT sensor\n");
+    }
+    else if (strncmp(command, "MODE:RIGHT", 10) == 0) {
+        sensor_mode = 1;
+        printf("Mode set: RIGHT sensor\n");
+    }
+    else if (strncmp(command, "MODE:AVG", 8) == 0) {
+        sensor_mode = 2; 
+        printf("Mode set: AVERAGE both sensors\n");
+    }
+    else if (strncmp(command, "MODE:MIN", 8) == 0) {
+        sensor_mode = 3;
+        printf("Mode set: MINIMUM of both sensors\n");
+    }
+    else if (strncmp(command, "PWM:", 4) == 0) {
+        pwm_value = atoi(command + 4);
+        set_motor_pwm(pwm_value);
+        printf("PWM set to: %d\n", pwm_value);
+    }
+}
+
+uint8_t calculate_pwm_based_on_mode(void) {
+    uint32_t effective_distance = 0;
+    
+    switch(sensor_mode) {
+        case 0: // Left sensor only
+            effective_distance = left_distance;
+            break;
+        case 1: // Right sensor only
+            effective_distance = right_distance;
+            break;
+        case 2: // Average of both
+            effective_distance = (left_distance + right_distance) / 2;
+            break;
+        case 3: // Minimum (closest object)
+            effective_distance = (left_distance < right_distance) ? left_distance : right_distance;
+            break;
+        default:
+            effective_distance = left_distance;
+    }
+    
+    // Convert distance to PWM (0-255)
+    if (effective_distance > 100) return 255;
+    else if (effective_distance > 50) return 200;
+    else if (effective_distance > 20) return 150;
+    else if (effective_distance > 10) return 100;
+    else return 0; // Too close - stop
+}
+
+// UART Receive Callback
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART2) {
+        char received_char = uart_buffer[uart_index];
+        
+        if (received_char == '\n') {
+            uart_buffer[uart_index] = '\0';
+            process_uart_command(uart_buffer);
+            uart_index = 0;
+        } else {
+            if (uart_index < 31) {
+                uart_buffer[uart_index++] = received_char;
+            } else {
+                uart_index = 0; // Reset on overflow
+            }
+        }
+        
+        HAL_UART_Receive_IT(&huart2, (uint8_t*)&uart_buffer[uart_index], 1);
+    }
+}
+
+void main_loop(void) {
+    while (1) {
+        // Baca kedua sensor
+        read_both_sensors();
+        
+        // Kirim data sensor ke ESP32
+        send_sensor_data();
+        
+        // Hitung PWM berdasarkan mode dan set motor
+        pwm_value = calculate_pwm_based_on_mode();
+        set_motor_pwm(pwm_value);
+        
+        HAL_Delay(100); // Update setiap 100ms
+    }
+}
+```
+
+## 📱 **4. Program ESP32 (Master & Bluetooth Controller)**
+
+```cpp
+/**
+ * ESP32 MASTER - DUAL SENSOR MODE SELECTOR
+ */
+
+#include "BluetoothSerial.h"
+
+BluetoothSerial SerialBT;
+
+// UART Communication
+#define STM32_RX 16
+#define STM32_TX 17
+
+// System State
+int current_mode = 0; // 0=Left, 1=Right, 2=Average, 3=Minimum
+float left_dist = 0;
+float right_dist = 0;
+String bt_data = "";
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(9600, SERIAL_8N1, STM32_RX, STM32_TX);
+  
+  SerialBT.begin("ESP32_DualSensor");
+  Serial.println("🚀 Dual Sensor Controller Ready");
+  Serial.println("Available Commands:");
+  Serial.println("  LEFT    - Use left sensor");
+  Serial.println("  RIGHT   - Use right sensor"); 
+  Serial.println("  AVG     - Use average of both");
+  Serial.println("  MIN     - Use minimum distance");
+  Serial.println("  STATUS  - Get current status");
+}
+
+void loop() {
+  handleBluetooth();
+  readSensorData();
+  delay(50);
+}
+
+void handleBluetooth() {
+  if (SerialBT.available()) {
+    char ch = SerialBT.read();
+    
+    if (ch == '\n') {
+      processBTCommand(bt_data);
+      bt_data = "";
+    } else {
+      bt_data += ch;
+    }
+  }
+}
+
+void processBTCommand(String cmd) {
+  cmd.toUpperCase();
+  cmd.trim();
+  
+  Serial.print("BT Command: ");
+  Serial.println(cmd);
+  
+  if (cmd == "LEFT") {
+    current_mode = 0;
+    SerialBT.println("🔷 Mode: LEFT Sensor");
+    sendToSTM32("MODE:LEFT");
+    
+  } else if (cmd == "RIGHT") {
+    current_mode = 1;
+    SerialBT.println("🔶 Mode: RIGHT Sensor"); 
+    sendToSTM32("MODE:RIGHT");
+    
+  } else if (cmd == "AVG") {
+    current_mode = 2;
+    SerialBT.println("📊 Mode: AVERAGE Both Sensors");
+    sendToSTM32("MODE:AVG");
+    
+  } else if (cmd == "MIN") {
+    current_mode = 3;
+    SerialBT.println("⚠️ Mode: MINIMUM Distance");
+    sendToSTM32("MODE:MIN");
+    
+  } else if (cmd == "STATUS") {
+    sendStatusReport();
+    
+  } else {
+    SerialBT.println("❌ Unknown command. Use: LEFT, RIGHT, AVG, MIN, STATUS");
+  }
+}
+
+void readSensorData() {
+  if (Serial2.available()) {
+    String data = Serial2.readStringUntil('\n');
+    data.trim();
+    
+    // Parse format: "SENSORS:L:125,R:180"
+    if (data.startsWith("SENSORS:")) {
+      int l_start = data.indexOf("L:");
+      int r_start = data.indexOf("R:");
+      int comma_pos = data.indexOf(',', l_start);
+      
+      if (l_start != -1 && r_start != -1) {
+        String left_str = data.substring(l_start + 2, comma_pos);
+        String right_str = data.substring(r_start + 2);
+        
+        left_dist = left_str.toFloat();
+        right_dist = right_str.toFloat();
+        
+        // Optional: Send update to Bluetooth
+        if (SerialBT.hasClient()) {
+          SerialBT.print("L:");
+          SerialBT.print(left_dist);
+          SerialBT.print("cm R:");
+          SerialBT.print(right_dist);
+          SerialBT.println("cm");
+        }
+      }
+    }
+  }
+}
+
+void sendStatusReport() {
+  SerialBT.println("=== DUAL SENSOR STATUS ===");
+  SerialBT.print("Mode: ");
+  switch(current_mode) {
+    case 0: SerialBT.println("LEFT Sensor"); break;
+    case 1: SerialBT.println("RIGHT Sensor"); break;
+    case 2: SerialBT.println("AVERAGE Both"); break;
+    case 3: SerialBT.println("MINIMUM Distance"); break;
+  }
+  SerialBT.print("Left Distance: "); SerialBT.print(left_dist); SerialBT.println(" cm");
+  SerialBT.print("Right Distance: "); SerialBT.print(right_dist); SerialBT.println(" cm");
+  
+  // Calculate effective distance based on mode
+  float effective_dist = calculateEffectiveDistance();
+  SerialBT.print("Effective Distance: "); SerialBT.print(effective_dist); SerialBT.println(" cm");
+  SerialBT.println("==========================");
+}
+
+float calculateEffectiveDistance() {
+  switch(current_mode) {
+    case 0: return left_dist;
+    case 1: return right_dist;
+    case 2: return (left_dist + right_dist) / 2.0;
+    case 3: return min(left_dist, right_dist);
+    default: return left_dist;
+  }
+}
+
+void sendToSTM32(String command) {
+  Serial2.println(command);
+  Serial.print("Sent to STM32: ");
+  Serial.println(command);
+}
+```
+
+## 🎯 **5. Bluetooth Commands yang Tersedia**
+
+```
+LEFT    → Gunakan hanya sensor kiri
+RIGHT   → Gunakan hanya sensor kanan  
+AVG     → Gunakan rata-rata kedua sensor
+MIN     → Gunakan nilai terdekat (minimum)
+STATUS  → Lihat status sistem
+```
+
+## 🔧 **6. Logika Kombinasi Sensor yang Dimungkinkan**
+
+### **Mode Average (Rata-rata):**
+```cpp
+effective_distance = (left_distance + right_distance) / 2
+```
+**Kegunaan**: Untuk aplikasi yang butuh stabilitas
+
+### **Mode Minimum:**
+```cpp
+effective_distance = min(left_distance, right_distance)  
+```
+**Kegunaan**: Untuk safety - berhenti jika ada objek dekat di salah satu sisi
+
+### **Mode Maximum:**
+```c
+effective_distance = max(left_distance, right_distance)
+```
+**Bisa ditambahkan** jika butuh mode agresif
+
+### **Mode Custom Weighted:**
+```c
+effective_distance = (left_distance * 0.7 + right_distance * 0.3)
+```
+**Bisa dikembangkan** untuk aplikasi khusus
+
+## ✅ **7. Keuntungan Implementasi Ini**
+
+### **👍 Kelebihan:**
+- **Fleksibilitas tinggi** dalam kontrol sensor
+- **Safety improved** dengan mode minimum
+- **Adaptive** bisa switch mode berdasarkan kondisi
+- **Debugging mudah** - bisa monitor kedua sensor
+- **Scalable** bisa tambah sensor lebih banyak
+
+### **🎯 Aplikasi Nyata:**
+- **Robot avoidance** - pakai mode minimum untuk safety
+- **Line following** - pakai mode individual untuk koreksi
+- **Wall following** - pakai mode average untuk stabilitas
+- **Object tracking** - switch mode berdasarkan situasi
+
+## 🚀 **8. Implementasi Recommendation**
+
+**Langkah implementasi:**
+1. ✅ Solder dua HC-SR04 ke STM32 dengan voltage divider
+2. ✅ Upload kode STM32 dual sensor
+3. ✅ Upload kode ESP32 mode selector  
+4. ✅ Test masing-masing sensor terpisah
+5. ✅ Test mode switching via Bluetooth
+6. ✅ Fine-tune PWM mapping untuk aplikasi spesifik
+
+**Konsep ini TIDAK HANYA mungkin, tapi sangat POWERFUL** untuk pengembangan sistem otonom yang cerdas! 🎯
+
+Semua kode di atas siap diimplementasikan dan memberikan kontrol yang sangat fleksibel atas sistem sensor dual Anda!
