@@ -1,0 +1,381 @@
+/**
+ * ESP32 Master Controller with HC-SR04 Mode + BLUETOOTH
+ * UART Communication with STM32F401
+ * Bluetooth Serial for remote control
+ * 
+ * Commands:
+ * - PWM:value    : Manual motor control
+ * - READ         : Read encoder
+ * - DIST         : Read distance
+ * - MODE:0       : Manual mode
+ * - MODE:1       : Auto distance mode
+ */
+
+#include <BluetoothSerial.h>
+
+HardwareSerial SerialSTM32(1);
+BluetoothSerial SerialBT;
+
+// UART Pins
+#define STM32_RX_PIN 16
+#define STM32_TX_PIN 17
+
+// Bluetooth Device Name
+#define BT_DEVICE_NAME "ESP32_Motor_Controller"
+
+// System Variables
+int current_mode = 0; // 0=Manual, 1=Auto Distance
+int manual_pwm = 0;
+int auto_pwm = 0;
+float current_distance = 0;
+int encoder_count = 0;
+String received_data = "";
+unsigned long last_auto_time = 0;
+bool bluetooth_connected = false;
+
+void setup() {
+  Serial.begin(115200);
+  SerialSTM32.begin(9600, SERIAL_8N1, STM32_RX_PIN, STM32_TX_PIN);
+  
+  // Initialize Bluetooth Serial
+  if (!SerialBT.begin(BT_DEVICE_NAME)) {
+    Serial.println("Bluetooth failed to initialize!");
+  } else {
+    Serial.println("Bluetooth initialized successfully!");
+    Serial.print("Device Name: ");
+    Serial.println(BT_DEVICE_NAME);
+  }
+  
+  delay(1000);
+  
+  Serial.println("==========================================");
+  Serial.println("   ESP32 Master with HC-SR04 + Bluetooth");
+  Serial.println("==========================================");
+  Serial.println("Commands:");
+  Serial.println("  PWM:value  - Set motor speed (-255 to 255)");
+  Serial.println("  READ       - Read encoder value");
+  Serial.println("  DIST       - Read distance");
+  Serial.println("  MODE:0     - Manual mode");
+  Serial.println("  MODE:1     - Auto distance mode");
+  Serial.println("  STATUS     - System status");
+  Serial.println("  HELP       - Show commands");
+  Serial.println("==========================================");
+  
+  // Send welcome message to Bluetooth
+  SerialBT.println("=== ESP32 Motor Controller ===");
+  SerialBT.println("Connect via Bluetooth Serial");
+  SerialBT.println("Send 'HELP' for commands");
+}
+
+void loop() {
+  handleSerialInput();
+  handleBluetoothInput();
+  handleSTM32Data();
+  
+  // Auto mode processing
+  if (current_mode == 1) {
+    if (millis() - last_auto_time > 200) { // Update every 200ms
+      calculateAutoPWM();
+      sendPWMCommand(auto_pwm);
+      last_auto_time = millis();
+    }
+  }
+  
+  // Check Bluetooth connection status
+  checkBluetoothConnection();
+  
+  delay(10);
+}
+
+void handleSerialInput() {
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    processInput(input, &Serial);
+  }
+}
+
+void handleBluetoothInput() {
+  if (SerialBT.available()) {
+    String input = SerialBT.readStringUntil('\n');
+    input.trim();
+    processInput(input, &SerialBT);
+  }
+}
+
+void processInput(String input, Stream *source) {
+  if (input.length() == 0) return;
+  
+  // Log received command
+  String logMsg = "Received: " + input;
+  if (source == &SerialBT) {
+    logMsg += " [BT]";
+  }
+  Serial.println(logMsg);
+  
+  if (input.startsWith("PWM:")) {
+    manual_pwm = input.substring(4).toInt();
+    if (manual_pwm >= -255 && manual_pwm <= 255) {
+      sendPWMCommand(manual_pwm);
+      sendResponse("Manual PWM: " + String(manual_pwm), source);
+    } else {
+      sendResponse("ERROR: PWM must be between -255 and 255", source);
+    }
+  }
+  else if (input.equalsIgnoreCase("READ")) {
+    sendReadCommand();
+    sendResponse("Reading encoder...", source);
+  }
+  else if (input.equalsIgnoreCase("DIST")) {
+    sendDistanceCommand();
+    sendResponse("Reading distance...", source);
+  }
+  else if (input.startsWith("MODE:")) {
+    int new_mode = input.substring(5).toInt();
+    if (new_mode == 0 || new_mode == 1) {
+      current_mode = new_mode;
+      sendModeCommand(current_mode);
+      String mode_str = (current_mode == 0) ? "Manual" : "Auto Distance";
+      sendResponse("Mode: " + mode_str, source);
+      
+      // Stop motor when switching modes
+      sendPWMCommand(0);
+    } else {
+      sendResponse("ERROR: Mode must be 0 or 1", source);
+    }
+  }
+  else if (input.equalsIgnoreCase("STATUS")) {
+    printSystemStatus(source);
+  }
+  else if (input.equalsIgnoreCase("HELP")) {
+    showHelp(source);
+  }
+  else if (input.equalsIgnoreCase("AUTO_TEST")) {
+    sendResponse("Starting Auto Mode Test...", source);
+    runAutoTest();
+    sendResponse("Auto Test Completed", source);
+  }
+  else if (input.equalsIgnoreCase("BT_STATUS")) {
+    String bt_status = "Bluetooth: ";
+    bt_status += bluetooth_connected ? "Connected" : "Disconnected";
+    bt_status += "\nDevice: " + String(BT_DEVICE_NAME);
+    sendResponse(bt_status, source);
+  }
+  else {
+    sendResponse("ERROR: Unknown command. Send 'HELP' for commands.", source);
+  }
+}
+
+void showHelp(Stream *source) {
+  String help_msg = 
+    "=== AVAILABLE COMMANDS ===\n"
+    "PWM:value  - Set motor speed (-255 to 255)\n"
+    "READ       - Read encoder value\n"
+    "DIST       - Read distance\n"
+    "MODE:0     - Manual mode\n"
+    "MODE:1     - Auto distance mode\n"
+    "STATUS     - System status\n"
+    "BT_STATUS  - Bluetooth status\n"
+    "AUTO_TEST  - Run auto mode test\n"
+    "HELP       - Show this help\n"
+    "==========================";
+  sendResponse(help_msg, source);
+}
+
+void sendResponse(String message, Stream *source) {
+  if (source == &Serial) {
+    Serial.println(message);
+  } else if (source == &SerialBT) {
+    SerialBT.println(message);
+  }
+}
+
+void handleSTM32Data() {
+  if (SerialSTM32.available()) {
+    received_data = SerialSTM32.readStringUntil('\n');
+    received_data.trim();
+    processSTM32Response(received_data);
+  }
+}
+
+void processSTM32Response(String response) {
+  if (response.startsWith("ACK:PWM:")) {
+    // Format: "ACK:PWM:value,ENC:count,DIST:distance"
+    parseSensorData(response);
+    
+    // Send update to both Serial and Bluetooth
+    String status_msg = "Update - PWM:" + String(manual_pwm) + 
+                       " ENC:" + String(encoder_count) + 
+                       " DIST:" + String(current_distance) + "cm";
+    Serial.println(status_msg);
+    if (bluetooth_connected) {
+      SerialBT.println(status_msg);
+    }
+  }
+  else if (response.startsWith("ENC:")) {
+    encoder_count = response.substring(4).toInt();
+    Serial.println("Encoder: " + String(encoder_count));
+    if (bluetooth_connected) {
+      SerialBT.println("Encoder: " + String(encoder_count));
+    }
+  }
+  else if (response.startsWith("DIST:")) {
+    current_distance = response.substring(5).toFloat();
+    Serial.println("Distance: " + String(current_distance) + " cm");
+    if (bluetooth_connected) {
+      SerialBT.println("Distance: " + String(current_distance) + " cm");
+    }
+  }
+  else if (response.startsWith("MODE:")) {
+    int mode = response.substring(5).toInt();
+    String mode_str = "STM32 Mode: " + String(mode);
+    Serial.println(mode_str);
+    if (bluetooth_connected) {
+      SerialBT.println(mode_str);
+    }
+  }
+  else if (response.startsWith("ERROR:")) {
+    Serial.println("STM32 Error: " + response);
+    if (bluetooth_connected) {
+      SerialBT.println("STM32 Error: " + response);
+    }
+  }
+  else {
+    // Debug output from STM32 - only send to Serial
+    Serial.println("STM32: " + response);
+  }
+}
+
+void parseSensorData(String data) {
+  int pwm_start = data.indexOf("PWM:") + 4;
+  int enc_start = data.indexOf("ENC:") + 4;
+  int dist_start = data.indexOf("DIST:") + 5;
+  
+  int comma1 = data.indexOf(',', pwm_start);
+  int comma2 = data.indexOf(',', enc_start);
+  
+  if (pwm_start != -1 && enc_start != -1 && dist_start != -1) {
+    String pwm_str = data.substring(pwm_start, comma1);
+    String enc_str = data.substring(enc_start, comma2);
+    String dist_str = data.substring(dist_start);
+    
+    manual_pwm = pwm_str.toInt();
+    encoder_count = enc_str.toInt();
+    current_distance = dist_str.toFloat();
+  }
+}
+
+void calculateAutoPWM() {
+  // Distance-based control logic
+  if (current_distance > 50.0) {
+    auto_pwm = 255; // Far distance - full speed
+  }
+  else if (current_distance > 30.0) {
+    auto_pwm = 200; // Medium distance - medium speed
+  }
+  else if (current_distance > 20.0) {
+    auto_pwm = 150; // Close distance - slow speed
+  }
+  else if (current_distance > 10.0) {
+    auto_pwm = 100; // Very close - very slow
+  }
+  else if (current_distance > 5.0) {
+    auto_pwm = 50;  // Too close - minimal speed
+  }
+  else {
+    auto_pwm = 0;   // Stop - object too close
+  }
+  
+  // Optional: Add dead zone to prevent constant switching
+  static int last_auto_pwm = 0;
+  if (abs(auto_pwm - last_auto_pwm) > 10) {
+    last_auto_pwm = auto_pwm;
+  } else {
+    auto_pwm = last_auto_pwm;
+  }
+}
+
+void sendPWMCommand(int pwm_value) {
+  String command = "PWM:" + String(pwm_value) + "\n";
+  SerialSTM32.print(command);
+}
+
+void sendReadCommand() {
+  SerialSTM32.print("READ\n");
+}
+
+void sendDistanceCommand() {
+  SerialSTM32.print("DIST\n");
+}
+
+void sendModeCommand(int mode) {
+  String command = "MODE:" + String(mode) + "\n";
+  SerialSTM32.print(command);
+}
+
+void printSystemStatus(Stream *source) {
+  String status_msg = 
+    "=== SYSTEM STATUS ===\n" +
+    String("Mode: ") + (current_mode == 0 ? "Manual" : "Auto Distance") + "\n" +
+    "Distance: " + String(current_distance) + " cm\n" +
+    "Encoder: " + String(encoder_count) + "\n" +
+    "Manual PWM: " + String(manual_pwm) + "\n" +
+    "Auto PWM: " + String(auto_pwm) + "\n" +
+    "Bluetooth: " + (bluetooth_connected ? "Connected" : "Disconnected") + "\n" +
+    "=====================";
+  sendResponse(status_msg, source);
+}
+
+void checkBluetoothConnection() {
+  static unsigned long last_check = 0;
+  static bool last_connected = false;
+  
+  if (millis() - last_check > 2000) { // Check every 2 seconds
+    bool currently_connected = (SerialBT.hasClient() > 0);
+    
+    if (currently_connected != last_connected) {
+      if (currently_connected) {
+        Serial.println("Bluetooth connected!");
+        SerialBT.println("=== Connected to ESP32 Motor Controller ===");
+        SerialBT.println("Send 'HELP' for available commands");
+      } else {
+        Serial.println("Bluetooth disconnected!");
+      }
+      last_connected = currently_connected;
+    }
+    
+    bluetooth_connected = currently_connected;
+    last_check = millis();
+  }
+}
+
+void runAutoTest() {
+  Serial.println("Starting Auto Mode Test...");
+  
+  // Switch to auto mode
+  sendModeCommand(1);
+  current_mode = 1;
+  delay(1000);
+  
+  // Test for 10 seconds
+  unsigned long test_start = millis();
+  while (millis() - test_start < 10000) {
+    handleSTM32Data();
+    calculateAutoPWM();
+    sendPWMCommand(auto_pwm);
+    
+    String test_status = "Auto Test - Distance: " + String(current_distance) + 
+                       "cm, PWM: " + String(auto_pwm);
+    Serial.println(test_status);
+    if (bluetooth_connected) {
+      SerialBT.println(test_status);
+    }
+    delay(200);
+  }
+  
+  // Stop and return to manual
+  sendPWMCommand(0);
+  sendModeCommand(0);
+  current_mode = 0;
+  Serial.println("Auto Test Completed");
+}
